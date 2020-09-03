@@ -1,3 +1,5 @@
+// @ts-nocheck
+
 /**
  * Copyright 2017 Google Inc. All rights reserved.
  *
@@ -26,21 +28,26 @@ const fulfillSymbol = Symbol('fullfil callback');
 const rejectSymbol = Symbol('reject callback');
 
 class TestServer {
+  PORT = undefined;
+  PREFIX = undefined;
+  CROSS_PROCESS_PREFIX = undefined;
+  EMPTY_PAGE = undefined;
+
   /**
    * @param {string} dirPath
    * @param {number} port
-   * @return {!TestServer}
+   * @returns {!TestServer}
    */
   static async create(dirPath, port) {
     const server = new TestServer(dirPath, port);
-    await new Promise(x => server._server.once('listening', x));
+    await new Promise((x) => server._server.once('listening', x));
     return server;
   }
 
   /**
    * @param {string} dirPath
    * @param {number} port
-   * @return {!TestServer}
+   * @returns {!TestServer}
    */
   static async createHTTPS(dirPath, port) {
     const server = new TestServer(dirPath, port, {
@@ -48,7 +55,7 @@ class TestServer {
       cert: fs.readFileSync(path.join(__dirname, 'cert.pem')),
       passphrase: 'aaaa',
     });
-    await new Promise(x => server._server.once('listening', x));
+    await new Promise((x) => server._server.once('listening', x));
     return server;
   }
 
@@ -60,10 +67,9 @@ class TestServer {
   constructor(dirPath, port, sslOptions) {
     if (sslOptions)
       this._server = https.createServer(sslOptions, this._onRequest.bind(this));
-    else
-      this._server = http.createServer(this._onRequest.bind(this));
-    this._server.on('connection', socket => this._onSocket(socket));
-    this._wsServer = new WebSocketServer({server: this._server});
+    else this._server = http.createServer(this._onRequest.bind(this));
+    this._server.on('connection', (socket) => this._onSocket(socket));
+    this._wsServer = new WebSocketServer({ server: this._server });
     this._wsServer.on('connection', this._onWebSocketConnection.bind(this));
     this._server.listen(port);
     this._dirPath = dirPath;
@@ -80,6 +86,8 @@ class TestServer {
     this._auths = new Map();
     /** @type {!Map<string, string>} */
     this._csp = new Map();
+    /** @type {!Set<string>} */
+    this._gzipRoutes = new Set();
     /** @type {!Map<string, !Promise>} */
     this._requestSubscribers = new Map();
   }
@@ -88,9 +96,8 @@ class TestServer {
     this._sockets.add(socket);
     // ECONNRESET is a legit error given
     // that tab closing simply kills process.
-    socket.on('error', error => {
-      if (error.code !== 'ECONNRESET')
-        throw error;
+    socket.on('error', (error) => {
+      if (error.code !== 'ECONNRESET') throw error;
     });
     socket.once('close', () => this._sockets.delete(socket));
   }
@@ -108,7 +115,11 @@ class TestServer {
    * @param {string} password
    */
   setAuth(path, username, password) {
-    this._auths.set(path, {username, password});
+    this._auths.set(path, { username, password });
+  }
+
+  enableGzip(path) {
+    this._gzipRoutes.add(path);
   }
 
   /**
@@ -121,10 +132,9 @@ class TestServer {
 
   async stop() {
     this.reset();
-    for (const socket of this._sockets)
-      socket.destroy();
+    for (const socket of this._sockets) socket.destroy();
     this._sockets.clear();
-    await new Promise(x => this._server.close(x));
+    await new Promise((x) => this._server.close(x));
   }
 
   /**
@@ -148,12 +158,11 @@ class TestServer {
 
   /**
    * @param {string} path
-   * @return {!Promise<!IncomingMessage>}
+   * @returns {!Promise<!IncomingMessage>}
    */
   waitForRequest(path) {
     let promise = this._requestSubscribers.get(path);
-    if (promise)
-      return promise;
+    if (promise) return promise;
     let fulfill, reject;
     promise = new Promise((f, r) => {
       fulfill = f;
@@ -169,6 +178,7 @@ class TestServer {
     this._routes.clear();
     this._auths.clear();
     this._csp.clear();
+    this._gzipRoutes.clear();
     const error = new Error('Static Server has been reset');
     for (const subscriber of this._requestSubscribers.values())
       subscriber[rejectSymbol].call(null, error);
@@ -176,18 +186,26 @@ class TestServer {
   }
 
   _onRequest(request, response) {
-    request.on('error', error => {
-      if (error.code === 'ECONNRESET')
-        response.end();
-      else
-        throw error;
+    request.on('error', (error) => {
+      if (error.code === 'ECONNRESET') response.end();
+      else throw error;
+    });
+    request.postBody = new Promise((resolve) => {
+      let body = '';
+      request.on('data', (chunk) => (body += chunk));
+      request.on('end', () => resolve(body));
     });
     const pathName = url.parse(request.url).path;
     if (this._auths.has(pathName)) {
       const auth = this._auths.get(pathName);
-      const credentials = Buffer.from((request.headers.authorization || '').split(' ')[1] || '', 'base64').toString();
+      const credentials = Buffer.from(
+        (request.headers.authorization || '').split(' ')[1] || '',
+        'base64'
+      ).toString();
       if (credentials !== `${auth.username}:${auth.password}`) {
-        response.writeHead(401, { 'WWW-Authenticate': 'Basic realm="Secure Area"' });
+        response.writeHead(401, {
+          'WWW-Authenticate': 'Basic realm="Secure Area"',
+        });
         response.end('HTTP Error 401 Unauthorized: Access is denied');
         return;
       }
@@ -212,11 +230,13 @@ class TestServer {
    * @param {string} pathName
    */
   serveFile(request, response, pathName) {
-    if (pathName === '/')
-      pathName = '/index.html';
+    if (pathName === '/') pathName = '/index.html';
     const filePath = path.join(this._dirPath, pathName.substring(1));
 
-    if (this._cachedPathPrefix !== null && filePath.startsWith(this._cachedPathPrefix)) {
+    if (
+      this._cachedPathPrefix !== null &&
+      filePath.startsWith(this._cachedPathPrefix)
+    ) {
       if (request.headers['if-modified-since']) {
         response.statusCode = 304; // not modified
         response.end();
@@ -230,14 +250,29 @@ class TestServer {
     if (this._csp.has(pathName))
       response.setHeader('Content-Security-Policy', this._csp.get(pathName));
 
-    fs.readFile(filePath, function(err, data) {
+    fs.readFile(filePath, (err, data) => {
       if (err) {
         response.statusCode = 404;
         response.end(`File not found: ${filePath}`);
         return;
       }
-      response.setHeader('Content-Type', mime.getType(filePath));
-      response.end(data);
+      const mimeType = mime.getType(filePath);
+      const isTextEncoding = /^text\/|^application\/(javascript|json)/.test(
+        mimeType
+      );
+      const contentType = isTextEncoding
+        ? `${mimeType}; charset=utf-8`
+        : mimeType;
+      response.setHeader('Content-Type', contentType);
+      if (this._gzipRoutes.has(pathName)) {
+        response.setHeader('Content-Encoding', 'gzip');
+        const zlib = require('zlib');
+        zlib.gzip(data, (_, result) => {
+          response.end(result);
+        });
+      } else {
+        response.end(data);
+      }
     });
   }
 
@@ -246,4 +281,4 @@ class TestServer {
   }
 }
 
-module.exports = {TestServer};
+module.exports = { TestServer };
